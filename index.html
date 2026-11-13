@@ -1,0 +1,850 @@
+<meta charset="utf-8">
+<title>一閃 ISSEN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@400;600&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap">
+<style>
+/* Layout: one full-bleed canvas. Ink on paper, one accent the player earns. */
+:root {
+  --bg: #F3F3F1;
+  --ink: #141416;
+  --mute: #8B8B93;
+  --faint: #DCDCD8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #101012; --ink: #ECECEA; --mute: #7C7C84; --faint: #2A2A2E; color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #101012; --ink: #ECECEA; --mute: #7C7C84; --faint: #2A2A2E; color-scheme: dark; }
+html, body { height: 100%; }
+body { margin: 0; overflow: hidden; background: var(--bg); color: var(--ink); -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+</style>
+<canvas id="c" aria-label="一閃: タップした場所へ斬り抜けるゲーム"></canvas>
+<script>
+(() => {
+'use strict';
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const JP = '"Zen Kaku Gothic New", "Hiragino Sans", "Yu Gothic", sans-serif';
+const NUM = '"Azeret Mono", ui-monospace, Menlo, Consolas, monospace';
+const RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const TAU = Math.PI * 2;
+
+// ---------- theme ----------
+const C = {};
+function readTheme() {
+  const s = getComputedStyle(document.documentElement);
+  for (const k of ['bg', 'ink', 'mute', 'faint']) C[k] = s.getPropertyValue('--' + k).trim();
+}
+readTheme();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', readTheme);
+new MutationObserver(readTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+const COLORS = [
+  { lv: 1, c: null }, { lv: 2, c: '#E5484D' }, { lv: 4, c: '#F76B15' }, { lv: 6, c: '#30A46C' },
+  { lv: 9, c: '#12A594' }, { lv: 12, c: '#0090FF' }, { lv: 16, c: '#9E6CD9' }, { lv: 20, c: '#E93D82' },
+];
+const acc = () => COLORS[save.color].c || C.ink;
+
+// ---------- sizing ----------
+let W = 0, H = 0, DPR = 1, U = 4;
+function resize() {
+  const r = cv.getBoundingClientRect();
+  W = r.width; H = r.height;
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  U = Math.sqrt(W * H) / 120;
+}
+new ResizeObserver(resize).observe(cv);
+resize();
+
+// ---------- save ----------
+const KEY = 'issen-save-v1';
+const DEF = { v: 1, best: 0, xp: 0, kills: 0, runs: 0, maxCombo: 0, color: 0, streak: 0, lastDay: '', mute: false, m: { day: '', list: [], p: [0, 0, 0], d: [0, 0, 0] } };
+const clone = o => JSON.parse(JSON.stringify(o));
+function normalize(s) { const o = Object.assign(clone(DEF), s); o.m = Object.assign(clone(DEF.m), s.m || {}); return o; }
+let save = clone(DEF);
+try { const s = JSON.parse(localStorage.getItem(KEY)); if (s && s.v === 1) save = normalize(s); } catch (e) {}
+
+let dbRef = null, writing = false, dirty = false;
+function pushRemote() {
+  if (!dbRef) return;
+  if (writing) { dirty = true; return; }
+  writing = true;
+  dbRef.set(clone(save)).catch(() => {}).finally(() => { writing = false; if (dirty) { dirty = false; pushRemote(); } });
+}
+function persist() {
+  try { localStorage.setItem(KEY, JSON.stringify(save)); } catch (e) {}
+  pushRemote();
+}
+// Cross-device save: the viewer's private subtree, when the page can reach it.
+(async () => {
+  try {
+    if (!window.claude || !window.claude.use) return;
+    const [db, user] = await Promise.all([claude.use('db'), claude.use('user')]);
+    if (!db || !user) return;
+    const id = await user.id();
+    if (!id) return;
+    const ref = db.doc('data/users/' + id + '/save');
+    const snap = await ref.get();
+    dbRef = ref;
+    const remote = snap.exists ? snap.data() : null;
+    if (remote && remote.v === 1 && (remote.xp > save.xp || (remote.xp === save.xp && remote.runs > save.runs))) {
+      const mute = save.mute;
+      save = normalize(remote); save.mute = mute;
+      try { localStorage.setItem(KEY, JSON.stringify(save)); } catch (e) {}
+      ensureDay();
+    } else if (save.runs > 0) pushRemote();
+  } catch (e) { dbRef = null; }
+})();
+
+// ---------- levels ----------
+const need = l => 80 + l * 40;
+function lvInfo(xp) { let l = 1; while (xp >= need(l)) { xp -= need(l); l++; } return { l, cur: xp, need: need(l) }; }
+
+// ---------- days & missions ----------
+const pad = n => String(n).padStart(2, '0');
+const dayKey = (d = new Date()) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+const yesterdayKey = () => { const d = new Date(); d.setDate(d.getDate() - 1); return dayKey(d); };
+function hash(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function rng32(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const POOL = {
+  score: { n: [1000, 2000, 3500], t: n => `1回で ${n} 点` },
+  combo: { n: [20, 35, 60], t: n => `コンボ ${n}` },
+  multi: { n: [3, 4, 5], t: n => `1回のダッシュで ${n} 体` },
+  chain: { n: [4, 8, 12], t: n => `誘爆で ${n} 体 (1回で)` },
+  close: { n: [3, 6, 10], t: n => `紙一重 ${n} 回 (1回で)` },
+  kills: { n: [150, 300], t: n => `今日 合計 ${n} 体` },
+  runs:  { n: [3, 5], t: n => `今日 ${n} 回挑戦` },
+};
+function ensureDay() {
+  const today = dayKey();
+  if (save.m.day === today && save.m.list.length === 3) return;
+  const r = rng32(hash('issen:' + today));
+  const keys = Object.keys(POOL);
+  for (let i = keys.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [keys[i], keys[j]] = [keys[j], keys[i]]; }
+  save.m = { day: today, list: keys.slice(0, 3).map(k => ({ k, n: POOL[k].n[Math.floor(r() * POOL[k].n.length)] })), p: [0, 0, 0], d: [0, 0, 0] };
+}
+ensureDay();
+function liveVal(i, withRun) {
+  const m = save.m.list[i], p = save.m.p[i];
+  if (!withRun) return p;
+  switch (m.k) {
+    case 'score': return Math.max(p, run.score);
+    case 'combo': return Math.max(p, run.maxCombo);
+    case 'multi': return Math.max(p, run.maxMulti);
+    case 'chain': return Math.max(p, run.chain);
+    case 'close': return Math.max(p, run.close);
+    case 'kills': return p + run.kills;
+    default: return p;
+  }
+}
+function checkMissions() {
+  if (state !== 'play') return;
+  for (let i = 0; i < 3; i++) {
+    const m = save.m.list[i];
+    if (!save.m.d[i] && liveVal(i, true) >= m.n) {
+      save.m.d[i] = 1; run.newDone.push(i);
+      toast('ミッション達成  ' + POOL[m.k].t(m.n));
+      sfxMission();
+    }
+  }
+}
+
+// ---------- audio ----------
+let AC = null, master = null, noiseBuf = null;
+function ensureAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = save.mute ? 0 : 0.55;
+    const comp = AC.createDynamicsCompressor();
+    master.connect(comp); comp.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+function tone(f, dur, o = {}) {
+  if (!AC || save.mute) return;
+  const t = AC.currentTime + (o.at || 0);
+  const osc = AC.createOscillator(), g = AC.createGain();
+  osc.type = o.type || 'sine';
+  osc.frequency.setValueAtTime(f, t);
+  if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(o.v || 0.2, t + (o.atk || 0.004));
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(g); g.connect(master); osc.start(t); osc.stop(t + dur + 0.03);
+}
+function noise(dur, o = {}) {
+  if (!AC || save.mute) return;
+  const t = AC.currentTime + (o.at || 0);
+  const src = AC.createBufferSource(); src.buffer = noiseBuf;
+  const f = AC.createBiquadFilter(); f.type = o.ft || 'bandpass'; f.Q.value = o.q || 1;
+  f.frequency.setValueAtTime(o.f || 1500, t);
+  if (o.to) f.frequency.exponentialRampToValueAtTime(o.to, t + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(o.v || 0.2, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f); f.connect(g); g.connect(master); src.start(t, Math.random() * 0.5); src.stop(t + dur + 0.02);
+}
+const SCALE = [0, 2, 4, 7, 9];
+const note = i => 261.63 * Math.pow(2, (Math.floor(i / 5) * 12 + SCALE[((i % 5) + 5) % 5]) / 12);
+function sfxDash() { noise(0.11, { v: 0.16, f: 700, to: 3800, q: 0.9 }); }
+function sfxKill(combo, hits) {
+  const i = combo <= 13 ? combo - 1 : 10 + (combo % 3);
+  tone(note(i), 0.16, { type: 'triangle', v: 0.26 });
+  tone(note(i) * 2, 0.07, { v: 0.07 });
+  noise(0.035, { v: 0.22, ft: 'highpass', f: 3000 });
+  if (hits >= 2) tone(note(i + 2), 0.14, { type: 'triangle', v: 0.12, at: 0.03 });
+}
+function sfxWhiff() { tone(120, 0.18, { v: 0.32, to: 55 }); noise(0.08, { v: 0.08, f: 300, to: 120 }); }
+function sfxBoom() { tone(90, 0.4, { v: 0.45, to: 32 }); noise(0.32, { v: 0.22, f: 1400, to: 150, ft: 'lowpass' }); }
+function sfxMulti(n) { const b = 7 + Math.min(n, 6); [0, 2, 4].forEach((k, j) => tone(note(b + k), 0.35, { type: 'triangle', v: 0.13, at: j * 0.035 })); }
+function sfxMilestone() { [0, 2, 4, 5, 7].forEach((k, j) => tone(note(5 + k), 0.3, { type: 'triangle', v: 0.14, at: j * 0.05 })); }
+function sfxDeath() { tone(240, 0.9, { type: 'sawtooth', v: 0.1, to: 38 }); sfxBoom(); }
+function sfxTick() { tone(2200, 0.02, { type: 'square', v: 0.025 }); }
+function sfxMission() { tone(note(12), 0.12, { type: 'triangle', v: 0.16 }); tone(note(14), 0.3, { type: 'triangle', v: 0.16, at: 0.09 }); }
+function sfxLevel() { [0, 2, 4, 7, 10].forEach((k, j) => tone(note(7 + k), 0.45, { type: 'triangle', v: 0.14, at: j * 0.06 })); }
+function sfxBest() { [0, 4, 7].forEach((k, j) => tone(note(10 + k), 0.6, { type: 'triangle', v: 0.15, at: j * 0.08 })); noise(0.4, { v: 0.06, ft: 'highpass', f: 5000 }); }
+function buzz(ms) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+// ---------- world state ----------
+let state = 'title'; // title | play | dying | over
+const P = { x: 0, y: 0, r: 1.9, dashing: false, fx: 0, fy: 0, tx: 0, ty: 0, t: 0, dur: 0, dirx: 0, diry: -1, hits: 0, recover: 0, grace: 0, buffer: null, land: 0, alive: true };
+let E = [], FX = [], RINGS = [], TXT = [], TRAIL = [], BOMBS = [], TOASTS = [];
+const newRun = () => ({ score: 0, combo: 0, maxCombo: 0, kills: 0, maxMulti: 0, chain: 0, close: 0, time: 0, spawnT: 0.7, newDone: [] });
+let run = newRun();
+let hitstop = 0, trauma = 0, kickX = 0, kickY = 0, slowT = 0, slowScale = 1, ts = 1, flash = 0, flashCol = null;
+let comboPulse = 0, dispScore = 0, scorePulse = 0, clock = 0;
+let startRing = { x: 0, y: 0, r: 7, hit: false }, startTimer = -1, titleFade = 1;
+let dieT = 0, res = null, resT = 0;
+const UI = { mute: null, sw: [], toTitle: null };
+const COMBO_MS = [10, 25, 50, 75, 100, 150, 200, 300, 500];
+
+const addTrauma = a => { trauma = Math.min(1, trauma + a); };
+const kick = (dx, dy, a) => { kickX += dx * a; kickY += dy * a; };
+const slow = (t, s) => { slowT = Math.max(slowT, t); slowScale = Math.min(slowT > t ? slowScale : 1, s); };
+function toast(text) { TOASTS.push({ text, t: 0 }); if (TOASTS.length > 3) TOASTS.shift(); }
+function pop(x, y, s, size, col, life = 0.7, fam = NUM) { TXT.push({ x, y, s, size, col, life, max: life, fam }); }
+function ring(x, y, r0, r1, life, w, col) { RINGS.push({ x, y, r0, r1, life, max: life, w, col }); }
+
+function distSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - ax - dx * t, py - ay - dy * t);
+}
+
+// ---------- effects ----------
+function splitFx(x, y, r, dx, dy, col, kind) {
+  const a = Math.atan2(dy, dx), nx = -dy, ny = dx;
+  for (const s of [-1, 1]) {
+    FX.push({ t: 'half', kind, x, y, vx: nx * s * (8 + Math.random() * 6) * U + dx * 10 * U, vy: ny * s * (8 + Math.random() * 6) * U + dy * 10 * U,
+      a, rot: 0, va: s * (3 + Math.random() * 5), r, side: s, life: 0.6, max: 0.6, col });
+  }
+  for (let i = 0; i < 8; i++) {
+    const sa = a + (Math.random() - 0.5) * 1.3, sp = (40 + Math.random() * 70) * U;
+    FX.push({ t: 'spark', x, y, vx: Math.cos(sa) * sp, vy: Math.sin(sa) * sp, len: (1 + Math.random() * 2.2) * U, life: 0.32, max: 0.32, col });
+  }
+  FX.push({ t: 'cut', x, y, a, len: r * 5, life: 0.14, max: 0.14, col });
+}
+
+// ---------- spawning ----------
+function edgePoint() {
+  const m = 4 * U, s = Math.random() * 4 | 0;
+  if (s === 0) return { x: Math.random() * W, y: -m };
+  if (s === 1) return { x: W + m, y: Math.random() * H };
+  if (s === 2) return { x: Math.random() * W, y: H + m };
+  return { x: -m, y: Math.random() * H };
+}
+function spawnEnemy(type, x, y) {
+  const base = type === 'dot' ? 19 : type === 'bomb' ? 7 : 9;
+  const spd = (base + Math.min(run.time, 120) * 0.09) * (0.9 + Math.random() * 0.2);
+  E.push({ x, y, vx: 0, vy: 0, r: type === 'dot' ? 1.5 : type === 'bomb' ? 2.6 : 2.4, type, spd, dead: false, born: 0, ph: Math.random() * TAU });
+}
+function spawnGroup() {
+  const p = edgePoint(), ang = Math.atan2(P.y - p.y, P.x - p.x), nx = -Math.sin(ang), ny = Math.cos(ang);
+  const k = Math.random();
+  if (k < 0.45) {
+    const n = 3 + (Math.random() * 3 | 0);
+    for (let i = 0; i < n; i++) { const o = (i - (n - 1) / 2) * 5.5 * U; spawnEnemy('ring', p.x + nx * o, p.y + ny * o); }
+  } else if (k < 0.8 && run.time > 8) {
+    spawnEnemy('bomb', p.x, p.y);
+    for (let i = 0; i < 5; i++) { const a = i / 5 * TAU; spawnEnemy('ring', p.x + Math.cos(a) * 6.5 * U, p.y + Math.sin(a) * 6.5 * U); }
+  } else {
+    for (let i = 0; i < 4; i++) spawnEnemy('ring', p.x - Math.cos(ang) * i * 6 * U, p.y - Math.sin(ang) * i * 6 * U);
+  }
+}
+function spawnTick(dt) {
+  run.spawnT -= dt;
+  if (run.spawnT > 0 || E.length > 42) return;
+  const t = run.time;
+  run.spawnT = Math.max(0.32, 1.2 - t * 0.013) * (0.7 + Math.random() * 0.6);
+  if (t > 5 && Math.random() < 0.2) return spawnGroup();
+  const p = edgePoint(), r = Math.random();
+  spawnEnemy(t > 15 && r < 0.16 ? 'dot' : t > 8 && r > 0.9 ? 'bomb' : 'ring', p.x, p.y);
+}
+
+// ---------- player ----------
+function startDash(x, y) {
+  let dx = x - P.x, dy = y - P.y, L = Math.hypot(dx, dy);
+  if (L < 1) { dx = P.dirx; dy = P.diry; L = 1; }
+  const ux = dx / L, uy = dy / L, dist = Math.min(Math.max(L, 6 * U), 60 * U), m = P.r * U + 6;
+  P.fx = P.x; P.fy = P.y;
+  P.tx = Math.max(m, Math.min(W - m, P.x + ux * dist));
+  P.ty = Math.max(m, Math.min(H - m, P.y + uy * dist));
+  P.dur = Math.max(0.055, Math.hypot(P.tx - P.x, P.ty - P.y) / (360 * U));
+  P.t = 0; P.dirx = ux; P.diry = uy; P.hits = 0; P.dashing = true;
+  sfxDash();
+}
+function dashInput(x, y) {
+  if (!P.alive) return;
+  if (P.dashing || (P.recover > 0 && P.recover < 0.12)) P.buffer = { x, y };
+  else if (P.recover <= 0) startDash(x, y);
+}
+function endDash() {
+  P.dashing = false; P.grace = 0.07; P.land = 1;
+  kick(P.dirx, P.diry, 0.6 * U);
+  if (state !== 'play') return;
+  if (P.hits === 0) {
+    if (run.combo >= 5) pop(P.x, P.y - 5 * U, 'BREAK', 3.2 * U, C.mute, 0.8);
+    run.combo = 0; P.recover = 0.3;
+    sfxWhiff(); addTrauma(0.14); buzz(30);
+  } else {
+    run.maxMulti = Math.max(run.maxMulti, P.hits);
+    if (P.hits >= 2) {
+      pop(P.x, P.y - 6 * U, P.hits + ' 斬', (3.4 + P.hits * 0.5) * U, acc(), 0.9, JP);
+      ring(P.x, P.y, P.r * U, (14 + P.hits * 4) * U, 0.45, 0.6 * U, acc());
+      sfxMulti(P.hits);
+      if (P.hits >= 3 && !RM) { flash = 0.6; flashCol = acc(); }
+    }
+    checkMissions();
+  }
+}
+function updatePlayer(dt) {
+  if (P.recover > 0) P.recover -= dt;
+  if (P.grace > 0) P.grace -= dt;
+  P.land *= Math.pow(0.0008, dt);
+  if (P.dashing) {
+    const px = P.x, py = P.y;
+    P.t += dt;
+    const k = Math.min(1, P.t / P.dur), e = 1 - (1 - k) * (1 - k);
+    P.x = P.fx + (P.tx - P.fx) * e; P.y = P.fy + (P.ty - P.fy) * e;
+    TRAIL.push({ x1: px, y1: py, x2: P.x, y2: P.y, life: 0.24, max: 0.24 });
+    for (const en of E) {
+      if (!en.dead && distSeg(en.x, en.y, px, py, P.x, P.y) < (en.r + P.r * 1.25) * U) kill(en, P.dirx, P.diry, 'dash');
+    }
+    if (state === 'title' && !startRing.hit && distSeg(startRing.x, startRing.y, px, py, P.x, P.y) < (startRing.r + P.r) * U) slashStart();
+    if (k >= 1) endDash();
+  }
+  if (!P.dashing && P.recover <= 0 && P.buffer) { const b = P.buffer; P.buffer = null; startDash(b.x, b.y); }
+}
+
+// ---------- kills ----------
+function kill(e, dx, dy, cause) {
+  e.dead = true;
+  run.combo++; run.kills++; run.maxCombo = Math.max(run.maxCombo, run.combo);
+  const mult = 1 + Math.min(9, Math.floor(run.combo / 10));
+  let pts = 10 * mult, close = false;
+  if (cause === 'dash') {
+    P.hits++;
+    pts *= P.hits;
+    if (Math.hypot(e.x - P.fx, e.y - P.fy) < (e.r + P.r + 5) * U) { close = true; run.close++; pts = Math.round(pts * 1.5); }
+    hitstop = Math.max(hitstop, Math.min(0.13, 0.045 + 0.016 * (P.hits - 1)));
+    addTrauma(0.16 + 0.04 * Math.min(P.hits, 5));
+    kick(dx, dy, 1.1 * U);
+  } else {
+    run.chain++;
+    hitstop = Math.max(hitstop, 0.03);
+    addTrauma(0.1);
+  }
+  run.score += pts; scorePulse = 1; comboPulse = 1;
+  const r = e.r * U;
+  splitFx(e.x, e.y, r, dx, dy, C.ink, e.type);
+  pop(e.x, e.y - r - 2 * U, '+' + pts, 2.2 * U, close ? acc() : C.mute, 0.6);
+  if (close) { pop(e.x, e.y + r + 3 * U, '紙一重', 2.4 * U, acc(), 0.7, JP); slow(0.14, 0.3); }
+  sfxKill(run.combo, cause === 'dash' ? P.hits : 1);
+  buzz(12);
+  if (e.type === 'bomb') BOMBS.push({ x: e.x, y: e.y, t: 0.08 });
+  if (COMBO_MS.includes(run.combo)) {
+    pop(W / 2, H * 0.3, run.combo + ' COMBO', 6 * U, acc(), 1.2);
+    ring(P.x, P.y, P.r * U, Math.max(W, H), 0.7, 0.8 * U, acc());
+    slow(0.4, 0.25); sfxMilestone();
+    if (!RM) { flash = 0.5; flashCol = acc(); }
+  }
+  checkMissions();
+}
+function explode(b) {
+  const R = 15 * U;
+  ring(b.x, b.y, 2 * U, R, 0.4, 1.2 * U, C.ink);
+  ring(b.x, b.y, 2 * U, R * 0.7, 0.3, 0.4 * U, C.ink);
+  sfxBoom(); addTrauma(0.35);
+  for (let i = 0; i < 12; i++) {
+    const a = Math.random() * TAU, sp = (50 + Math.random() * 60) * U;
+    FX.push({ t: 'spark', x: b.x, y: b.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, len: 2 * U, life: 0.4, max: 0.4, col: C.ink });
+  }
+  if (state !== 'play') return;
+  for (const e of E) {
+    if (e.dead) continue;
+    const d = Math.hypot(e.x - b.x, e.y - b.y);
+    if (d < R + e.r * U) kill(e, (e.x - b.x) / (d || 1), (e.y - b.y) / (d || 1), 'chain');
+  }
+}
+
+// ---------- flow ----------
+function slashStart() {
+  startRing.hit = true;
+  splitFx(startRing.x, startRing.y, startRing.r * U, P.dirx, P.diry, C.ink, 'ring');
+  ring(startRing.x, startRing.y, startRing.r * U, 30 * U, 0.5, 0.6 * U, acc());
+  hitstop = 0.12; addTrauma(0.4); sfxMulti(3); buzz(20);
+  startTimer = 0.45;
+}
+function beginPlay() {
+  ensureDay();
+  state = 'play'; run = newRun(); E = []; BOMBS = [];
+  P.alive = true; P.recover = 0; P.buffer = null;
+  dispScore = 0; startTimer = -1;
+}
+function restart() {
+  FX = []; TRAIL = []; TXT = [];
+  P.x = W / 2; P.y = H / 2; P.dashing = false; P.land = 1;
+  ring(P.x, P.y, 0, 20 * U, 0.4, 0.5 * U, acc());
+  tone(note(7), 0.12, { type: 'triangle', v: 0.14 });
+  beginPlay();
+}
+function goTitle() {
+  state = 'title'; E = []; BOMBS = []; TXT = [];
+  P.alive = true; P.dashing = false; P.recover = 0; P.buffer = null;
+  layoutTitle(); P.x = W / 2; P.y = L.py;
+  startRing.hit = false; startTimer = -1; titleFade = 0;
+}
+function die(e) {
+  P.alive = false; P.dashing = false; state = 'dying'; dieT = 0;
+  hitstop = 0.16; slow(1.2, 0.16); addTrauma(1);
+  if (!RM) { flash = 1; flashCol = C.ink; }
+  for (let i = 0; i < 16; i++) {
+    const a = Math.random() * TAU, sp = (20 + Math.random() * 70) * U;
+    FX.push({ t: 'spark', x: P.x, y: P.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, len: (1.5 + Math.random() * 2) * U, life: 0.9, max: 0.9, col: acc() });
+  }
+  ring(P.x, P.y, P.r * U, 40 * U, 0.9, 0.8 * U, acc());
+  sfxDeath(); buzz(90);
+}
+function finishRun() {
+  const today = dayKey(), lv0 = lvInfo(save.xp).l;
+  if (save.lastDay !== today) { save.streak = save.lastDay === yesterdayKey() ? save.streak + 1 : 1; save.lastDay = today; }
+  save.runs++; save.kills += run.kills; save.maxCombo = Math.max(save.maxCombo, run.maxCombo);
+  const prevBest = save.best, newBest = run.score > prevBest && run.score > 0;
+  if (newBest) save.best = run.score;
+  const newDone = run.newDone.slice();
+  for (let i = 0; i < 3; i++) {
+    const m = save.m.list[i];
+    save.m.p[i] = m.k === 'runs' ? save.m.p[i] + 1 : liveVal(i, true);
+    if (!save.m.d[i] && save.m.p[i] >= m.n) { save.m.d[i] = 1; newDone.push(i); }
+  }
+  const allBonus = newDone.length > 0 && save.m.d.every(Boolean) ? 100 : 0;
+  const streakMult = 1 + Math.min(save.streak - 1, 10) * 0.05;
+  const gain = Math.round(run.score / 20 * streakMult) + newDone.length * 60 + allBonus;
+  const xp0 = save.xp;
+  save.xp += gain;
+  const lv1 = lvInfo(save.xp).l;
+  const unlocked = COLORS.map((c, i) => i).filter(i => COLORS[i].lv > lv0 && COLORS[i].lv <= lv1);
+  if (unlocked.length) save.color = unlocked[unlocked.length - 1];
+  persist();
+  res = { score: run.score, prevBest, newBest, maxCombo: run.maxCombo, kills: run.kills, maxMulti: run.maxMulti, gain, xp0, xp1: save.xp,
+    newDone, allBonus, streakMult, unlocked, shownLv: lv0, lvFlash: 0, bestShown: false, tickAcc: 0 };
+  state = 'over'; resT = 0;
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function frame(now) {
+  const rdt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(rdt); render();
+  requestAnimationFrame(frame);
+}
+function update(rdt) {
+  clock += rdt;
+  if (slowT > 0) { slowT -= rdt; if (slowT <= 0) slowScale = 1; }
+  ts += ((slowT > 0 ? slowScale : 1) - ts) * Math.min(1, rdt * 14);
+  trauma = Math.max(0, trauma - rdt * 1.6);
+  const kd = Math.pow(0.0004, rdt); kickX *= kd; kickY *= kd;
+  flash = Math.max(0, flash - rdt * 5);
+  comboPulse = Math.max(0, comboPulse - rdt * 4);
+  scorePulse = Math.max(0, scorePulse - rdt * 5);
+  for (const t of TOASTS) t.t += rdt;
+  TOASTS = TOASTS.filter(t => t.t < 2.6);
+  if (state === 'title' && startTimer < 0) titleFade = Math.min(1, titleFade + rdt * 3);
+  if (startTimer >= 0) { titleFade = Math.max(0, titleFade - rdt * 4); startTimer -= rdt; if (startTimer < 0) beginPlay(); }
+  if (state === 'dying') { dieT += rdt; if (dieT > 1.15) finishRun(); }
+  if (state === 'over') { resT += rdt; updateResults(rdt); }
+  if (hitstop > 0) { hitstop -= rdt; return; }
+  sim(rdt * ts);
+}
+function sim(dt) {
+  if (state === 'play') { run.time += dt; spawnTick(dt); }
+  updatePlayer(dt);
+  if (state === 'play' || state === 'dying') {
+    for (const e of E) {
+      if (e.dead) continue;
+      e.born += dt; e.ph += dt;
+      const dx = P.x - e.x, dy = P.y - e.y, d = Math.hypot(dx, dy) || 1;
+      const sp = (state === 'dying' ? 0.3 : 1) * e.spd * U;
+      e.vx += (dx / d * sp - e.vx) * Math.min(1, dt * 2.5);
+      e.vy += (dy / d * sp - e.vy) * Math.min(1, dt * 2.5);
+      e.x += e.vx * dt; e.y += e.vy * dt;
+      if (state === 'play' && P.alive && !P.dashing && P.grace <= 0 && d < (e.r + P.r) * U * 0.85) die(e);
+    }
+    for (let i = 0; i < E.length; i++) for (let j = i + 1; j < E.length; j++) {
+      const a = E[i], b = E[j], dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy), m = (a.r + b.r) * U * 0.9;
+      if (d > 0 && d < m) { const p = (m - d) / d * 0.25; a.x -= dx * p; a.y -= dy * p; b.x += dx * p; b.y += dy * p; }
+    }
+  }
+  E = E.filter(e => !e.dead);
+  for (const b of BOMBS) { b.t -= dt; if (b.t <= 0) explode(b); }
+  BOMBS = BOMBS.filter(b => b.t > 0);
+  for (const f of FX) {
+    f.life -= dt; f.x += f.vx * dt || 0; f.y += f.vy * dt || 0;
+    if (f.vx !== undefined) { const dr = Math.pow(0.03, dt); f.vx *= dr; f.vy *= dr; }
+    if (f.t === 'half') f.rot += f.va * dt;
+  }
+  FX = FX.filter(f => f.life > 0);
+  for (const r of RINGS) r.life -= dt;
+  RINGS = RINGS.filter(r => r.life > 0);
+  for (const t of TXT) { t.life -= dt; t.y -= 6 * U * dt; }
+  TXT = TXT.filter(t => t.life > 0);
+  for (const t of TRAIL) t.life -= dt;
+  TRAIL = TRAIL.filter(t => t.life > 0);
+  dispScore += (run.score - dispScore) * Math.min(1, dt * 14);
+  if (Math.abs(run.score - dispScore) < 1) dispScore = run.score;
+}
+function updateResults(rdt) {
+  const counting = resT > 0.15 && resT < 0.85;
+  if (counting) { res.tickAcc += rdt; if (res.tickAcc > 0.045) { res.tickAcc = 0; sfxTick(); } }
+  if (!res.bestShown && resT > 0.9) {
+    res.bestShown = true;
+    if (res.newBest) { sfxBest(); addTrauma(0.35); ring(W / 2, H * 0.3, 0, Math.max(W, H) * 0.6, 0.8, 0.6 * U, acc()); }
+  }
+  const lv = lvInfo(xpShown()).l;
+  if (lv > res.shownLv) { res.shownLv = lv; res.lvFlash = 1; sfxLevel(); addTrauma(0.25); }
+  res.lvFlash = Math.max(0, res.lvFlash - rdt * 1.2);
+}
+const ease = t => 1 - Math.pow(1 - Math.max(0, Math.min(1, t)), 3);
+const xpShown = () => res.xp0 + (res.xp1 - res.xp0) * ease((resT - 1.05) / 0.9);
+
+// ---------- drawing ----------
+function txt(s, x, y, size, o = {}) {
+  ctx.globalAlpha = o.a === undefined ? 1 : o.a;
+  ctx.fillStyle = o.col || C.ink;
+  ctx.font = (o.w || 500) + ' ' + size + 'px ' + (o.fam || JP);
+  ctx.textAlign = o.align || 'center';
+  ctx.textBaseline = o.base || 'middle';
+  if ('letterSpacing' in ctx) ctx.letterSpacing = (o.ls || 0) + 'px';
+  ctx.fillText(s, x, y);
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+  ctx.globalAlpha = 1;
+}
+function bar(x, y, w, h, k, col) {
+  ctx.fillStyle = C.faint; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = col; ctx.fillRect(x, y, w * Math.max(0, Math.min(1, k)), h);
+}
+const easeBack = t => { const c = 1.9; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+
+function drawWorld() {
+  // combo numeral behind everything
+  if ((state === 'play' || state === 'dying') && run.combo >= 2) {
+    const s = 1 + comboPulse * 0.08, size = Math.min(W, H) * 0.42;
+    ctx.save(); ctx.translate(W / 2, H / 2); ctx.scale(s, s);
+    txt(String(run.combo), 0, 0, size, { fam: NUM, w: 600, a: 0.055 });
+    const mult = 1 + Math.min(9, Math.floor(run.combo / 10));
+    if (mult > 1) txt('×' + mult, 0, size * 0.48, size * 0.16, { fam: NUM, w: 600, a: 0.18, col: acc() });
+    ctx.restore();
+  }
+  ctx.lineCap = 'round';
+  for (const t of TRAIL) {
+    const k = t.life / t.max;
+    ctx.globalAlpha = k * 0.85; ctx.strokeStyle = acc(); ctx.lineWidth = P.r * 2 * U * k;
+    ctx.beginPath(); ctx.moveTo(t.x1, t.y1); ctx.lineTo(t.x2, t.y2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  for (const r of RINGS) {
+    const k = 1 - r.life / r.max;
+    ctx.globalAlpha = 1 - k; ctx.strokeStyle = r.col; ctx.lineWidth = r.w * (1 - k * 0.7);
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r0 + (r.r1 - r.r0) * ease(k), 0, TAU); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  // title start ring
+  if (state === 'title' && !startRing.hit) {
+    const pulse = 1 + Math.sin(clock * 3) * 0.04;
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 0.55 * U;
+    ctx.beginPath(); ctx.arc(startRing.x, startRing.y, startRing.r * U * pulse, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 0.25 * (1 - (clock % 1.6) / 1.6);
+    ctx.beginPath(); ctx.arc(startRing.x, startRing.y, startRing.r * U * (1 + (clock % 1.6) / 1.6 * 0.6), 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 1;
+    txt('斬って開始', startRing.x, startRing.y, Math.max(12, 2.2 * U), { w: 700, ls: 2 });
+  }
+  for (const e of E) {
+    const s = e.born < 0.25 ? Math.max(0, easeBack(e.born / 0.25)) : 1, r = e.r * U;
+    ctx.save(); ctx.translate(e.x, e.y); ctx.scale(s, s);
+    ctx.strokeStyle = C.ink; ctx.fillStyle = C.ink; ctx.lineWidth = 0.5 * U;
+    if (e.type === 'ring') { ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.stroke(); }
+    else if (e.type === 'dot') { ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill(); }
+    else {
+      ctx.rotate(e.ph * 1.2);
+      ctx.strokeRect(-r * 0.85, -r * 0.85, r * 1.7, r * 1.7);
+      const q = r * (0.3 + Math.sin(e.ph * 8) * 0.08);
+      ctx.fillRect(-q, -q, q * 2, q * 2);
+    }
+    ctx.restore();
+  }
+  for (const f of FX) {
+    const k = f.life / f.max;
+    ctx.globalAlpha = Math.min(1, k * 1.4);
+    ctx.strokeStyle = f.col; ctx.fillStyle = f.col;
+    if (f.t === 'half') {
+      ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.a + f.rot);
+      const r = f.r * (0.7 + 0.3 * k);
+      ctx.lineWidth = 0.5 * U; ctx.beginPath();
+      if (f.kind === 'bomb') { if (f.side > 0) ctx.rect(-r * 0.85, 0, r * 1.7, r * 0.85); else ctx.rect(-r * 0.85, -r * 0.85, r * 1.7, r * 0.85); ctx.stroke(); }
+      else { ctx.arc(0, 0, r, f.side > 0 ? 0 : Math.PI, f.side > 0 ? Math.PI : TAU); f.kind === 'dot' ? ctx.fill() : ctx.stroke(); }
+      ctx.restore();
+    } else if (f.t === 'spark') {
+      const v = Math.hypot(f.vx, f.vy) || 1;
+      ctx.lineWidth = 0.35 * U; ctx.beginPath();
+      ctx.moveTo(f.x, f.y); ctx.lineTo(f.x - f.vx / v * f.len * k, f.y - f.vy / v * f.len * k); ctx.stroke();
+    } else if (f.t === 'cut') {
+      const l = f.len * (1.2 - k * 0.2);
+      ctx.lineWidth = 0.35 * U * k + 0.5; ctx.beginPath();
+      ctx.moveTo(f.x - Math.cos(f.a) * l, f.y - Math.sin(f.a) * l); ctx.lineTo(f.x + Math.cos(f.a) * l, f.y + Math.sin(f.a) * l); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (P.alive) {
+    const r = P.r * U, a = Math.atan2(P.diry, P.dirx);
+    let sx = 1, sy = 1;
+    if (P.dashing) { sx = 1.8; sy = 0.6; } else { sx = 1 - 0.3 * P.land; sy = 1 + 0.3 * P.land; }
+    const breathe = state === 'title' && !P.dashing ? 1 + Math.sin(clock * 4) * 0.05 : 1;
+    ctx.save(); ctx.translate(P.x, P.y); ctx.rotate(a); ctx.scale(sx * breathe, sy * breathe);
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU);
+    if (P.recover > 0) { ctx.strokeStyle = acc(); ctx.lineWidth = 0.5 * U; ctx.stroke(); }
+    else { ctx.fillStyle = acc(); ctx.fill(); }
+    ctx.restore();
+  }
+  for (const t of TXT) {
+    const age = t.max - t.life, s = 1 + 0.7 * Math.max(0, 1 - age / 0.1);
+    ctx.save(); ctx.translate(t.x, t.y); ctx.scale(s, s);
+    txt(t.s, 0, 0, t.size, { fam: t.fam, w: 600, col: t.col, a: Math.min(1, t.life / t.max * 2.5) });
+    ctx.restore();
+  }
+}
+
+function drawMute() {
+  const s = Math.max(12, 1.9 * U), x = W - Math.max(16, 3 * U), y = Math.max(22, 4 * U);
+  txt(save.mute ? '音 OFF' : '音 ON', x, y, s, { fam: JP, align: 'right', col: C.mute, w: 500 });
+  ctx.font = '500 ' + s + 'px ' + JP;
+  const w = ctx.measureText(save.mute ? '音 OFF' : '音 ON').width;
+  UI.mute = { x: x - w - 12, y: y - s, w: w + 24, h: s * 2 };
+}
+
+function drawHUD() {
+  const m = Math.max(16, 3 * U), s = Math.max(22, 5 * U), k = 1 + scorePulse * 0.12;
+  ctx.save(); ctx.translate(m, m + s * 0.6); ctx.scale(k, k);
+  txt(String(Math.round(dispScore)), 0, 0, s, { fam: NUM, w: 600, align: 'left' });
+  ctx.restore();
+  txt('BEST ' + Math.max(save.best, run.score), m, m + s * 1.45, Math.max(11, 1.6 * U), { fam: NUM, align: 'left', col: C.mute, ls: 1 });
+  if (save.runs === 0 && run.time < 7 && state === 'play') {
+    const a = Math.min(1, (7 - run.time) / 1.5) * 0.9;
+    txt('タップした場所へ斬り抜ける', W / 2, H - Math.max(48, 9 * U), Math.max(13, 2 * U), { col: C.mute, a });
+    txt('空振りするとコンボが途切れて、少しのあいだ動けない', W / 2, H - Math.max(48, 9 * U) + Math.max(20, 3 * U), Math.max(12, 1.7 * U), { col: C.mute, a });
+  }
+}
+
+let L = {};
+function layoutTitle() {
+  const colW = Math.min(W - 32, 440);
+  L = { colW, x0: (W - colW) / 2, ty: H * 0.13, ry: H * 0.33, py: H * 0.47, iy: H * 0.56 };
+  startRing.x = W / 2; startRing.y = L.ry;
+}
+function fmtLeft() {
+  const n = new Date(), mid = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1);
+  const s = Math.max(0, Math.floor((mid - n) / 1000));
+  return pad(Math.floor(s / 3600)) + ':' + pad(Math.floor(s / 60) % 60) + ':' + pad(s % 60);
+}
+function drawMissions(x0, y, w, lh, highlight, alpha) {
+  for (let i = 0; i < 3; i++) {
+    const m = save.m.list[i], done = !!save.m.d[i], yy = y + i * lh;
+    const v = Math.min(m.n, liveVal(i, false)), box = Math.max(10, 1.6 * U);
+    const hl = highlight && highlight.includes(i);
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = done ? acc() : C.mute; ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0, yy - box / 2, box, box);
+    if (done) { ctx.fillStyle = acc(); ctx.fillRect(x0 + 3, yy - box / 2 + 3, box - 6, box - 6); }
+    ctx.globalAlpha = 1;
+    txt(POOL[m.k].t(m.n), x0 + box + 10, yy, Math.max(13, 1.9 * U), { align: 'left', a: alpha * (done && !hl ? 0.45 : 1), col: hl ? acc() : C.ink, w: hl ? 700 : 500 });
+    txt(done ? '達成' : v + '/' + m.n, x0 + w, yy, Math.max(11, 1.6 * U), { align: 'right', fam: done ? JP : NUM, col: done ? acc() : C.mute, a: alpha });
+  }
+}
+function drawTitle() {
+  layoutTitle();
+  const a = titleFade, { colW, x0 } = L, today = dayKey();
+  const ts1 = Math.max(44, Math.min(11 * U, 96));
+  txt('一閃', W / 2, L.ty, ts1, { w: 700, a, ls: ts1 * 0.1 });
+  txt('ISSEN', W / 2, L.ty + ts1 * 0.72, Math.max(11, 1.6 * U), { fam: NUM, col: C.mute, a, ls: 6 });
+  txt('タップした場所へ一瞬で斬り抜ける', W / 2, L.ry + 7 * U + Math.max(26, 4.5 * U), Math.max(12, 1.8 * U), { col: C.mute, a });
+
+  // level + best + streak
+  const li = lvInfo(save.xp), fs = Math.max(13, 1.9 * U);
+  let y = L.iy;
+  txt('Lv ' + li.l, x0, y, fs, { fam: NUM, w: 600, align: 'left', a });
+  ctx.globalAlpha = a; bar(x0 + fs * 3.6, y - 2, colW - fs * 3.6 - fs * 6.5, 4, li.cur / li.need, acc()); ctx.globalAlpha = 1;
+  txt('BEST ' + save.best, x0 + colW, y, fs, { fam: NUM, align: 'right', a });
+  y += fs * 2;
+  let streakLine = '';
+  if (save.lastDay === today) streakLine = '連続 ' + save.streak + ' 日プレイ中';
+  else if (save.lastDay === yesterdayKey()) streakLine = '今日遊ぶと 連続 ' + (save.streak + 1) + ' 日';
+  else if (save.runs > 0) streakLine = '今日から連続記録をもう一度';
+  if (streakLine) txt(streakLine, x0, y, Math.max(12, 1.7 * U), { align: 'left', col: save.lastDay === today ? C.ink : acc(), a, w: 700 });
+  txt('更新まで ' + fmtLeft(), x0 + colW, y, Math.max(11, 1.6 * U), { fam: NUM, align: 'right', col: C.mute, a });
+  y += fs * 1.9;
+  txt('今日のミッション', x0, y, Math.max(11, 1.6 * U), { align: 'left', col: C.mute, a, ls: 2 });
+  y += fs * 1.6;
+  drawMissions(x0, y, colW, fs * 1.9, null, a);
+
+  // color swatches
+  UI.sw = [];
+  const n = COLORS.length, sr = Math.max(7, 1.3 * U), gap = Math.min(colW / n, sr * 5.5);
+  const sy = H - Math.max(40, 7 * U), sx0 = W / 2 - gap * (n - 1) / 2;
+  for (let i = 0; i < n; i++) {
+    const x = sx0 + i * gap, open = li.l >= COLORS[i].lv, col = COLORS[i].c || C.ink;
+    ctx.globalAlpha = a;
+    ctx.beginPath(); ctx.arc(x, sy, sr, 0, TAU);
+    if (open) { ctx.fillStyle = col; ctx.fill(); } else { ctx.strokeStyle = C.faint; ctx.lineWidth = 1.5; ctx.stroke(); }
+    if (i === save.color) { ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, sy, sr + 4, 0, TAU); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    if (!open) txt('Lv' + COLORS[i].lv, x, sy + sr + 10, Math.max(9, 1.2 * U), { fam: NUM, col: C.mute, a });
+    UI.sw.push({ x, y: sy, r: sr + 8, i, open });
+  }
+}
+
+function drawResults() {
+  const k = Math.min(1, resT / 0.3);
+  ctx.globalAlpha = 0.88 * k; ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+  const colW = Math.min(W - 32, 420), x0 = (W - colW) / 2, fs = Math.max(13, 1.9 * U);
+  let y = H * 0.17;
+  txt('SCORE', W / 2, y, Math.max(11, 1.6 * U), { fam: NUM, col: C.mute, ls: 4, a: k });
+  y += Math.max(44, 8 * U);
+  const shown = Math.round(res.score * ease((resT - 0.15) / 0.7));
+  const big = Math.max(48, Math.min(15 * U, 128));
+  const bs = res.bestShown && res.newBest ? 1 + 0.15 * Math.max(0, 1 - (resT - 0.9) / 0.25) : 1;
+  ctx.save(); ctx.translate(W / 2, y); ctx.scale(bs, bs);
+  txt(String(shown), 0, 0, big, { fam: NUM, w: 600, col: res.newBest && res.bestShown ? acc() : C.ink });
+  ctx.restore();
+  y += big * 0.75;
+  if (res.bestShown) {
+    if (res.newBest) txt(res.prevBest > 0 ? '自己ベスト更新  +' + (res.score - res.prevBest) : '初記録', W / 2, y, fs, { w: 700, col: acc(), ls: 2 });
+    else txt('ベストまで あと ' + (res.prevBest - res.score + 1) + ' 点', W / 2, y, fs, { col: C.mute });
+  }
+  y += fs * 2.6;
+  // stats
+  const stats = [['最大コンボ', res.maxCombo], ['撃破', res.kills], ['最大同時斬り', res.maxMulti]];
+  stats.forEach((s, i) => {
+    const x = x0 + colW * (i + 0.5) / 3, a = Math.min(1, Math.max(0, (resT - 0.3 - i * 0.08) / 0.2));
+    txt(String(s[1]), x, y, Math.max(20, 3.6 * U), { fam: NUM, w: 600, a });
+    txt(s[0], x, y + Math.max(20, 3.4 * U), Math.max(11, 1.5 * U), { col: C.mute, a });
+  });
+  y += Math.max(64, 10 * U);
+  // xp
+  const xa = Math.min(1, Math.max(0, (resT - 0.9) / 0.2));
+  const li = lvInfo(xpShown());
+  const lvS = 1 + res.lvFlash * 0.4;
+  ctx.save(); ctx.translate(x0, y); ctx.scale(lvS, lvS);
+  txt('Lv ' + li.l, 0, 0, fs, { fam: NUM, w: 600, align: 'left', a: xa, col: res.lvFlash > 0 ? acc() : C.ink });
+  ctx.restore();
+  ctx.globalAlpha = xa; bar(x0 + fs * 4, y - 3, colW - fs * 4 - fs * 5, 6, li.cur / li.need, acc()); ctx.globalAlpha = 1;
+  txt('+' + res.gain + ' XP', x0 + colW, y, fs, { fam: NUM, align: 'right', a: xa });
+  y += fs * 1.7;
+  const notes = [];
+  if (res.streakMult > 1) notes.push('連続 ' + save.streak + ' 日ボーナス ×' + res.streakMult.toFixed(2));
+  if (res.allBonus) notes.push('デイリー全達成 +' + res.allBonus);
+  if (res.shownLv > lvInfo(res.xp0).l) notes.push('LEVEL UP');
+  if (res.unlocked.length && resT > 1.5) notes.push('新しい色を解放');
+  else {
+    const nx = COLORS.find(c => c.lv > li.l);
+    if (nx) { let xp = 0; for (let l = 1; l < nx.lv; l++) xp += need(l); notes.push('次の色まで あと ' + Math.max(0, Math.ceil(xp - xpShown())) + ' XP'); }
+  }
+  txt(notes.join('   '), x0, y, Math.max(11, 1.6 * U), { align: 'left', col: res.lvFlash > 0 ? acc() : C.mute, a: xa, w: 700 });
+  y += fs * 2.4;
+  const ma = Math.min(1, Math.max(0, (resT - 1.2) / 0.3));
+  drawMissions(x0, y, colW, fs * 1.9, res.newDone, ma);
+  // controls
+  const by = H - Math.max(44, 8 * U);
+  if (resT > 0.45) {
+    txt('タップでもう一度', W / 2, by - Math.max(30, 5 * U), Math.max(15, 2.3 * U), { w: 700, a: 0.55 + 0.45 * Math.sin(clock * 5), ls: 2 });
+    const ts2 = Math.max(12, 1.7 * U);
+    txt('タイトルへ', W / 2, by + 6, ts2, { col: C.mute });
+    UI.toTitle = { x: W / 2 - ts2 * 4, y: by + 6 - ts2 * 1.4, w: ts2 * 8, h: ts2 * 2.8 };
+  } else UI.toTitle = null;
+}
+
+function drawToasts() {
+  TOASTS.forEach((t, i) => {
+    const inK = ease(t.t / 0.25), outK = t.t > 2.2 ? 1 - (t.t - 2.2) / 0.4 : 1;
+    const y = Math.max(70, 12 * U) + i * Math.max(28, 4.4 * U) - (1 - inK) * 20;
+    txt(t.text, W / 2, y, Math.max(13, 1.9 * U), { w: 700, col: acc(), a: inK * outK });
+  });
+}
+
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const amp = trauma * trauma * 3 * U * (RM ? 0.25 : 1);
+  const sx = (Math.random() * 2 - 1) * amp + kickX * (RM ? 0.3 : 1), sy = (Math.random() * 2 - 1) * amp + kickY * (RM ? 0.3 : 1);
+  const rot = (Math.random() * 2 - 1) * trauma * trauma * 0.025 * (RM ? 0.25 : 1);
+  ctx.save();
+  ctx.translate(W / 2 + sx, H / 2 + sy); ctx.rotate(rot); ctx.translate(-W / 2, -H / 2);
+  if (state === 'title') drawTitle();
+  drawWorld();
+  ctx.restore();
+  ctx.save(); ctx.translate(sx * 0.35, sy * 0.35);
+  if (state === 'play' || state === 'dying') drawHUD();
+  if (state === 'over') drawResults();
+  drawToasts();
+  ctx.restore();
+  drawMute();
+  if (flash > 0) { ctx.globalAlpha = flash * 0.14; ctx.fillStyle = flashCol || C.ink; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+}
+
+// ---------- input ----------
+const inRect = (r, x, y) => r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  ensureAudio();
+  const b = cv.getBoundingClientRect(), x = e.clientX - b.left, y = e.clientY - b.top;
+  if (inRect(UI.mute, x, y)) {
+    save.mute = !save.mute; persist();
+    if (master) master.gain.value = save.mute ? 0 : 0.55;
+    return;
+  }
+  if (state === 'title') {
+    for (const s of UI.sw) {
+      if (Math.hypot(x - s.x, y - s.y) < s.r) {
+        if (s.open) { save.color = s.i; persist(); tone(note(7 + s.i), 0.15, { type: 'triangle', v: 0.15 }); ring(s.x, s.y, 0, 5 * U, 0.3, 2, acc()); }
+        else { toast('Lv ' + COLORS[s.i].lv + ' で解放'); sfxWhiff(); }
+        return;
+      }
+    }
+    if (startTimer < 0) dashInput(x, y);
+  } else if (state === 'play') dashInput(x, y);
+  else if (state === 'over' && resT > 0.45) { inRect(UI.toTitle, x, y) ? goTitle() : restart(); }
+});
+window.addEventListener('keydown', e => {
+  if (state === 'over' && resT > 0.45 && (e.code === 'Space' || e.code === 'Enter')) { ensureAudio(); restart(); }
+});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+try { document.fonts.load('700 20px "Zen Kaku Gothic New"', '一閃斬'); document.fonts.load('600 20px "Azeret Mono"', '0123'); } catch (e) {}
+goTitle();
+titleFade = 1;
+requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
